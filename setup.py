@@ -2,6 +2,7 @@ import setuptools
 
 REQUIRED_PACKAGES = [
     'torch',
+    'torchvision',
     'lmdb'
 ]
 
@@ -12,7 +13,7 @@ setuptools.setup(
     name="glow",
     version="0.1.1",
     author="Emmanuel Fuentes",
-    description="PyTorch Generative Flow Model Package",
+    description="PyTorch Generative Flow Modeling Package",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/eifuentes/glow-pytorch",
