@@ -6,16 +6,6 @@ from numpy.random import randn
 from scipy.linalg import lu, qr
 
 
-# TODO: check out batchnorm implementation (provide data init method)
-class ActNorm(nn.Module):
-    """ ActNorm Layer.
-
-        Activation normalizaton module...
-    """
-    def __init__(self):
-        super().__init__()
-
-
 class Bijector(nn.Module):
     """ Bijector Module Abstract Base Class """
     def __init__(self):
@@ -30,12 +20,8 @@ class Bijector(nn.Module):
         """ Bijector Inverse Function """
         raise NotImplementedError
 
-    def _forward_fn_logdet(self, x):
+    def _logdet(self):
         """ Bijector Log Determinant of the Absolute Value of the Forward Function Jacobian """
-        raise NotImplementedError
-
-    def _inverse_fn_logdet(self, y):
-        """ Bijector Log Determinant of the Absolute Value of the Inverse Function Jacobian """
         raise NotImplementedError
 
     def direction(self, mode='forward'):
@@ -46,6 +32,60 @@ class Bijector(nn.Module):
 
     def forward(self, data, accum=None):
         return self._bijector_fn(data, accum)
+
+
+class ActivationNormalization(Bijector):
+    """ ActNorm Layer.
+
+        Activation normalizaton module...
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.direction('forward')
+        self.initialized = False
+        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.shift = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def _data_initialization(self, x):
+        assert len(x.size()) == 4, 'ActNorm initialization requires inputs of the form (batch, channel, height, width)'
+
+        mean = x.mean(dim=[0, 2, 3], keepdim=True)
+        var = x.var(dim=[0, 2, 3], keepdim=True)
+
+        self.shift.data.copy_(mean)
+        self.scale.data.copy_(var)
+
+        self.initialized = True
+
+    def _forward_fn(self, x, accum=None):
+        """ Forward Function """
+        logdet = self._logdet(x)
+        accum = accum + logdet if accum else logdet
+        x_norm = ((x * self.scale) + self.shift)
+        return x_norm, accum
+
+    def _inverse_fn(self, y, accum=None):
+        """ Inverse Function """
+        logdet = self._logdet(y)
+        accum = accum - logdet if accum else logdet
+        y_norm = ((y - self.shift) / self.scale)
+        return y_norm, accum
+
+    def _logdet(self, x):
+        assert len(x.size()) == 4, 'ActNorm module requires inputs of the form (batch, channel, height, width)'
+        h, w = x.size(2), x.size(3)
+        return h * w * torch.abs(self.scale).log().sum()
+
+    def direction(self, mode='forward'):
+        if mode not in ('forward', 'inverse'):
+            raise ValueError('direction does not support {}. must be either forward or inverse'.format(mode))
+        self._normalization_fn = self._inverse_fn if mode == 'inverse' else self._forward_fn
+        # TODO mimic nn.Module.train/eval calls children's direction if it exists
+
+    def forward(self, x):
+        if not self.initialized:
+            self._data_initialization(x)
+        return self._normalization_fn(x)
 
 
 class Inv1x1Conv2dPlainBijector(Bijector):
@@ -62,24 +102,21 @@ class Inv1x1Conv2dPlainBijector(Bijector):
 
     def _forward_fn(self, x, accum=None):
         y = F.conv2d(x, self.weight)
-        logdet = self._forward_fn_logdet(x)
+        logdet = self._logdet(x)
         accum = accum + logdet if accum else logdet
         return y, accum
 
     def _inverse_fn(self, y, accum=None):
         inverse_weight = torch.inverse(self.weight)
         x = F.conv2d(y, inverse_weight)
-        logdet = self._inverse_fn_logdet(y)
+        logdet = self._logdet(y)
         accum = accum - logdet if accum else logdet
         return x, accum
 
-    def _forward_fn_logdet(self, x):
+    def _logdet(self, x):
         assert len(x.size()) == 4, 'Invertible1by1Conv2d module requires inputs of the form (batch, channel, height, width)'
         h, w = x.size(2), x.size(3)
         return h * w * torch.slogdet(self.weight)[1]
-
-    def _inverse_fn_logdet(self, y):
-        return self._forward_fn_logdet(y)
 
 
 class Inv1x1Conv2dLUBijector(Bijector):
@@ -122,7 +159,7 @@ class Inv1x1Conv2dLUBijector(Bijector):
     def _forward_fn(self, x, accum=None):
         weight = self._calc_weight()
         y = F.conv2d(x, weight)
-        logdet = self._forward_fn_logdet()
+        logdet = self._logdet()
         accum = accum + logdet if accum else logdet
         return y, accum
 
@@ -130,15 +167,12 @@ class Inv1x1Conv2dLUBijector(Bijector):
         weight = self._calc_weights()
         inverse_weight = torch.inverse(weight)
         x = F.conv2d(y, inverse_weight)
-        logdet = self._inverse_fn_logdet(y)
+        logdet = self._logdet(y)
         accum = accum - logdet if accum else logdet
         return x, accum
 
-    def _forward_fn_logdet(self):
+    def _logdet(self):
         return torch.abs(self.weight_s).log().sum()
-
-    def _inverse_fn_logdet(self):
-        return self._forward_fn_logdet()
 
 
 class AffineCouplingBijector(Bijector):
@@ -148,7 +182,7 @@ class AffineCouplingBijector(Bijector):
         self.layer = layer
 
     def _forward_fn(self, x, accum=None):
-        assert len(x.size()) == 4, 'Invertible1by1Conv2d module requires inputs of the form (batch, channel, height, width)'
+        assert len(x.size()) == 4, 'AffineCouplingBijector module requires inputs of the form (batch, channel, height, width)'
         # forward fn
         num_channels = x.size(1)
         channel_split_size = num_channels // 2
@@ -159,12 +193,12 @@ class AffineCouplingBijector(Bijector):
         y_b = x_b
         y = torch.concat(y_a, y_b, dim=1)
         # log determinant
-        logdet = self._forward_fn_logdet(s)
+        logdet = self._logdet(s)
         accum = accum + logdet if accum else logdet
         return y, accum
 
     def _inverse_fn(self, y, accum=None):
-        assert len(y.size()) == 4, 'Invertible1by1Conv2d module requires inputs of the form (batch, channel, height, width)'
+        assert len(y.size()) == 4, 'AffineCouplingBijector module requires inputs of the form (batch, channel, height, width)'
         # inverse fn
         num_channels = y.size(1)
         channel_split_size = num_channels // 2
@@ -175,12 +209,9 @@ class AffineCouplingBijector(Bijector):
         x_b = y_b
         x = torch.concat(x_a, x_b, dim=1)
         # log determinant
-        logdet = self._inverse_fn_logdet(y)
+        logdet = self._logdet(y)
         accum = accum - logdet if accum else logdet
         return x, accum
 
-    def _forward_fn_logdet(self, s):
+    def _logdet(self, s):
         return torch.abs(s).log().sum()
-
-    def _inverse_fn_logdet(self, s):
-        raise self._forward_fn_logdet(s)
