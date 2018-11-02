@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,18 +22,82 @@ class Bijector(nn.Module):
         """ Bijector Inverse Function """
         raise NotImplementedError
 
-    def _logdet(self):
-        """ Bijector Log Determinant of the Absolute Value of the Forward Function Jacobian """
-        raise NotImplementedError
-
     def direction(self, mode='forward'):
         if mode not in ('forward', 'inverse'):
             raise ValueError('bijector direction does not support {}. must be either forward or inverse'.format(mode))
-        self._bijector_fn = self._inverse_fn if mode == 'inverse' else self._forward_fn
+        self._fn = self._inverse_fn if mode == 'inverse' else self._forward_fn
         # TODO mimic nn.Module.train/eval calls children's direction if it exists
 
     def forward(self, data, accum=None):
-        return self._bijector_fn(data, accum)
+        return self._fn(data, accum)
+
+
+class Block(Bijector):
+    """ Block """
+    def __init__(self, in_channels, flow_depth=5, num_affine_channels=512, use_lu=False, do_split=True):
+        super().__init__()
+
+        squeeze_channels = in_channels * 4
+
+        self.k = flow_depth
+
+        modules = list()
+        for i in range(1, self.k+1):
+            modules.append(Flow(in_channels, num_affine_channels, use_lu))
+        self.flows = nn.ModuleList(modules)
+
+    def _forward_fn(self, data, accum=None):
+        for flow in self.flows:
+            data, accum = flow(data, accum)
+        return data, accum
+
+    def _inverse_fn(self, y, accum=None):
+        for flow in reversed(self.flows):
+            data, accum = flow(y, accum)
+        return data, accum
+
+
+class Split(nn.Module):
+    """ Split """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, accum=None):
+        return x.chunk(2, dim=1), accum
+
+
+class Squeeze(nn.Module):
+    """ Squeeze """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, y=None, accum=None):
+        if y:
+            x = torch.concat([x, y], dim=1)
+        return x, accum
+
+
+class Flow(Bijector):
+    """  """
+    def __init__(self, in_channels, num_affine_channels=512, use_lu=False):
+        super().__init__()
+
+        Inv1x1Conv2dBijector = Inv1x1Conv2dLUBijector if use_lu else Inv1x1Conv2dPlainBijector
+        convblock = AffineCouplingConv2d(in_channels, num_affine_channels)
+
+        self.flow = nn.Sequential(OrderedDict([
+            ('actnorm', ActivationNormalization(in_channels)),
+            ('inv1x1', Inv1x1Conv2dBijector(in_channels)),
+            ('coupling', AffineCouplingBijector(layer=convblock)),
+        ]))
+
+    def _forward_fn(self, x, accum=None):
+        """ Bijector Forward Function """
+        return self.flow(x, accum)
+
+    def _inverse_fn(self, y, accum=None):
+        """ Bijector Inverse Function """
+        return self._forward_fn(y, accum)
 
 
 class ActivationNormalization(Bijector):
@@ -41,7 +107,6 @@ class ActivationNormalization(Bijector):
     """
     def __init__(self, channels):
         super().__init__()
-        self.direction('forward')
         self.initialized = False
         self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.shift = nn.Parameter(torch.zeros(1, channels, 1, 1))
@@ -49,11 +114,12 @@ class ActivationNormalization(Bijector):
     def _data_initialization(self, x):
         assert len(x.size()) == 4, 'ActNorm initialization requires inputs of the form (batch, channel, height, width)'
 
-        mean = x.mean(dim=[0, 2, 3], keepdim=True)
-        var = x.var(dim=[0, 2, 3], keepdim=True)
+        with torch.no_grad():
+            mean = x.mean(dim=[0, 2, 3], keepdim=True)
+            var = x.var(dim=[0, 2, 3], keepdim=True)
 
-        self.shift.data.copy_(mean)
-        self.scale.data.copy_(var)
+            self.shift.data.copy_(mean)
+            self.scale.data.copy_(var)
 
         self.initialized = True
 
@@ -76,22 +142,16 @@ class ActivationNormalization(Bijector):
         h, w = x.size(2), x.size(3)
         return h * w * torch.abs(self.scale).log().sum()
 
-    def direction(self, mode='forward'):
-        if mode not in ('forward', 'inverse'):
-            raise ValueError('direction does not support {}. must be either forward or inverse'.format(mode))
-        self._normalization_fn = self._inverse_fn if mode == 'inverse' else self._forward_fn
-        # TODO mimic nn.Module.train/eval calls children's direction if it exists
-
-    def forward(self, x):
+    def forward(self, data, accum=None):
         if not self.initialized:
-            self._data_initialization(x)
-        return self._normalization_fn(x)
+            self._data_initialization(data)
+        return self._fn(data, accum)
 
 
 class Inv1x1Conv2dPlainBijector(Bijector):
     """ Inv1x1Conv2dPlainBijector """
     def __init__(self, channels):
-        Bijector.__init__()
+        super().__init__()
         self.channels = channels
         weight = self._calc_initial_weight()
         self.weight = nn.Parameter(weight)
@@ -173,6 +233,55 @@ class Inv1x1Conv2dLUBijector(Bijector):
 
     def _logdet(self):
         return torch.abs(self.weight_s).log().sum()
+
+
+class ZeroInitConv2d(nn.Module):
+    """ ZeroInitConv2d. """
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=0, scale=3.0):
+        super().__init__()
+
+        self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.conv2d.weight.data.zero_()
+        self.conv2d.bias.data.zero_()
+
+        self.scale = scale
+        self.logs = nn.Parameter(torch.zeros(1, out_channels, 1, 1))
+
+    def reset_parameters(self):
+        self.conv2d.weight.data.zero_()
+        self.conv2d.bias.data.zero_()
+        self.logs.zero_()
+
+    def forward(self, x):
+        x = self.conv2d(x)
+        x = x * torch.exp(self.logs * self.scale)
+        return x
+
+
+class AffineCouplingConv2d(nn.Module):
+    """ AffineCouplingConv2d """
+    def __init__(self, in_channels, num_channels=512, scale=3.0):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.num_channels = num_channels
+
+        self.block = nn.Sequential(OrderedDict([
+            ('conv_1', nn.Conv2d(in_channels // 2, self.num_channels, 3, padding=1)),
+            ('relu_1', nn.ReLU(True)),
+            ('conv_2', nn.Conv2d(self.num_channels, self.num_channels, 1, padding=0)),
+            ('relu_2', nn.ReLU(True)),
+            ('conv_3', ZeroInitConv2d(self.num_channels, self.num_channels, 3, padding=0, scale=scale))
+        ]))
+
+        self.block['conv_1'].weight.data.normal_(0, 0.05)
+        self.block['conv_1'].bias.data.zero_()
+
+        self.block['conv_3'].weight.data.normal_(0, 0.05)
+        self.block['conv_3'].bias.data.zero_()
+
+    def forward(self, x):
+        return self.layer(x)
 
 
 class AffineCouplingBijector(Bijector):
