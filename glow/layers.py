@@ -34,7 +34,7 @@ class Bijector(nn.Module):
 
 class Block(Bijector):
     """ Block """
-    def __init__(self, in_channels, flow_depth=5, num_affine_channels=512, use_lu=False, do_split=True):
+    def __init__(self, in_channels, flow_depth=5, num_affine_channels=512, use_lu_optim=False, split_input=True):
         super().__init__()
 
         squeeze_channels = in_channels * 4
@@ -43,7 +43,7 @@ class Block(Bijector):
 
         modules = list()
         for i in range(1, self.k+1):
-            modules.append(Flow(in_channels, num_affine_channels, use_lu))
+            modules.append(Flow(in_channels, num_affine_channels, use_lu_optim))
         self.flows = nn.ModuleList(modules)
 
     def _forward_fn(self, data, accum=None):
@@ -79,10 +79,10 @@ class Squeeze(nn.Module):
 
 class Flow(Bijector):
     """  """
-    def __init__(self, in_channels, num_affine_channels=512, use_lu=False):
+    def __init__(self, in_channels, num_affine_channels=512, use_lu_optim=False):
         super().__init__()
 
-        Inv1x1Conv2dBijector = Inv1x1Conv2dLUBijector if use_lu else Inv1x1Conv2dPlainBijector
+        Inv1x1Conv2dBijector = Inv1x1Conv2dLUBijector if use_lu_optim else Inv1x1Conv2dPlainBijector
         convblock = AffineCouplingConv2d(in_channels, num_affine_channels)
 
         self.flow = nn.Sequential(OrderedDict([
