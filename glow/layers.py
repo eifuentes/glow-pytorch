@@ -108,15 +108,15 @@ class ActivationNormalization(Bijector):
     def __init__(self, channels):
         super().__init__()
         self.initialized = False
-        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.shift = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def _data_initialization(self, x):
         assert len(x.size()) == 4, 'ActNorm initialization requires inputs of the form (batch, channel, height, width)'
 
         with torch.no_grad():
-            mean = x.mean(dim=[0, 2, 3], keepdim=True)
-            var = x.var(dim=[0, 2, 3], keepdim=True)
+            mean = x.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True).mean(dim=0, keepdim=True)
+            var = x.var(dim=3, keepdim=True).var(dim=2, keepdim=True).var(dim=0, keepdim=True)
 
             self.shift.data.copy_(mean)
             self.scale.data.copy_(var)
@@ -126,14 +126,14 @@ class ActivationNormalization(Bijector):
     def _forward_fn(self, x, accum=None):
         """ Forward Function """
         logdet = self._logdet(x)
-        accum = accum + logdet if accum else logdet
+        accum = accum + logdet if isinstance(accum, torch.Tensor) else logdet
         x_norm = ((x * self.scale) + self.shift)
         return x_norm, accum
 
     def _inverse_fn(self, y, accum=None):
         """ Inverse Function """
         logdet = self._logdet(y)
-        accum = accum - logdet if accum else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
         y_norm = ((y - self.shift) / self.scale)
         return y_norm, accum
 
@@ -161,16 +161,16 @@ class Inv1x1Conv2dPlainBijector(Bijector):
         return rotation
 
     def _forward_fn(self, x, accum=None):
-        y = F.conv2d(x, self.weight)
+        y = F.conv2d(x, self.weight.view(self.channels, self.channels, 1, 1))
         logdet = self._logdet(x)
-        accum = accum + logdet if accum else logdet
+        accum = accum + logdet if isinstance(accum, torch.Tensor) else logdet
         return y, accum
 
     def _inverse_fn(self, y, accum=None):
         inverse_weight = torch.inverse(self.weight)
-        x = F.conv2d(y, inverse_weight)
+        x = F.conv2d(y, inverse_weight.view(self.channels, self.channels, 1, 1))
         logdet = self._logdet(y)
-        accum = accum - logdet if accum else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
         return x, accum
 
     def _logdet(self, x):
@@ -186,53 +186,62 @@ class Inv1x1Conv2dLUBijector(Bijector):
         self.channels = channels
         weight = self._calc_initial_weight()  # initial permutation weight
         # learnable parameters
-        self.weight_lower = nn.Parameter(weight['l'])
-        self.weight_upper = nn.Parameter(weight['u'])
-        self.weight_s = nn.Parameter(weight['s'])
+        self.lower = nn.Parameter(weight['lower'])
+        self.upper = nn.Parameter(weight['upper'])
+        self.logdiag = nn.Parameter(weight['logdiag'])
         # persistented parameters
-        self.register_buffer('weight_permutation', weight['p'])
-        self.register_buffer('s_sign', weight['s_sign'])
-        self.register_buffer('fixed_s_sign', weight['s_abslog'])
+        self.register_buffer('permutation', weight['permutation'])
+        self.register_buffer('signdiag', weight['signdiag'])
+        self.register_buffer('maskupper', weight['maskupper'])
+        self.register_buffer('masklower', weight['masklower'])
+        self.register_buffer('eyelower', weight['eyelower'])
 
     def _calc_initial_weight(self):
         rotation = qr(randn(self.channels, self.channels))[0].astype('float32')  # sample random rotation matrix
         permutation, lower, upper = [torch.from_numpy(m) for m in lu(rotation)]
-        s = torch.diag(upper)
-        s_sign = torch.sign(s)
-        s_abs_log = torch.abs(s).log()
+        diagonal = torch.diag(upper)
+        signdiag = torch.sign(diagonal)
+        logdiag = torch.abs(diagonal).log()
         upper = torch.triu(upper, diagonal=1)
+        maskupper = torch.triu(torch.ones_like(upper), diagonal=1)
+        masklower = maskupper.transpose(0, 1)
+        eyelower = torch.eye(masklower.size(0))
         return {
-            'p': permutation,
-            'u': upper,
-            'l': lower,
-            's': s,
-            's_sign': s_sign,
-            's_abslog': s_abs_log,
+            'permutation': permutation,
+            'upper': upper,
+            'maskupper': maskupper,
+            'lower': lower,
+            'masklower': masklower,
+            'eyelower': eyelower,
+            'signdiag': signdiag,
+            'logdiag': logdiag
         }
 
-    def _calc_weight(self):
-        return torch.matmul(
-            torch.matmul(self.weight_permutation, self.weight_lower),
-            torch.add(self.weight_upper + self.weight_s)
-        )
+    def _get_weights(self):
+        lower = (self.lower * self.masklower) + self.eyelower
+        upper = (self.upper * self.maskupper) + torch.diag(self.signdiag * torch.exp(self.logdiag))
+        return self.permutation, lower, upper
 
     def _forward_fn(self, x, accum=None):
-        weight = self._calc_weight()
-        y = F.conv2d(x, weight)
-        logdet = self._logdet()
-        accum = accum + logdet if accum else logdet
+        permutation, lower, upper = self._get_weights()
+        weight = torch.matmul(permutation, torch.matmul(lower, upper))
+        y = F.conv2d(x, weight.view(self.channels, self.channels, 1, 1))
+        logdet = self._logdet(x)
+        accum = accum + logdet if isinstance(accum, torch.Tensor) else logdet
         return y, accum
 
     def _inverse_fn(self, y, accum=None):
-        weight = self._calc_weights()
-        inverse_weight = torch.inverse(weight)
-        x = F.conv2d(y, inverse_weight)
+        permutation, lower, upper = self._get_weights()
+        inverse_weight = torch.matmul(torch.inverse(upper), torch.matmul(torch.inverse(lower), torch.inverse(permutation)))
+        x = F.conv2d(y, inverse_weight.view(self.channels, self.channels, 1, 1))
         logdet = self._logdet(y)
-        accum = accum - logdet if accum else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
         return x, accum
 
-    def _logdet(self):
-        return torch.abs(self.weight_s).log().sum()
+    def _logdet(self, x):
+        assert len(x.size()) == 4, 'Invertible1by1Conv2d module requires inputs of the form (batch, channel, height, width)'
+        h, w = x.size(2), x.size(3)
+        return h * w * self.logdiag.sum()
 
 
 class ZeroInitConv2d(nn.Module):
@@ -274,11 +283,11 @@ class AffineCouplingConv2d(nn.Module):
             ('conv_3', ZeroInitConv2d(self.num_channels, self.num_channels, 3, padding=0, scale=scale))
         ]))
 
-        self.block['conv_1'].weight.data.normal_(0, 0.05)
-        self.block['conv_1'].bias.data.zero_()
+        self.block.conv_1.weight.data.normal_(0, 0.05)
+        self.block.conv_1.bias.data.zero_()
 
-        self.block['conv_3'].weight.data.normal_(0, 0.05)
-        self.block['conv_3'].bias.data.zero_()
+        self.block.conv_2.weight.data.normal_(0, 0.05)
+        self.block.conv_2.bias.data.zero_()
 
     def forward(self, x):
         return self.layer(x)
@@ -287,7 +296,7 @@ class AffineCouplingConv2d(nn.Module):
 class AffineCouplingBijector(Bijector):
     """ AffineCouplingBijector """
     def __init__(self, layer):
-        super.__init__()
+        super().__init__()
         self.layer = layer
 
     def _forward_fn(self, x, accum=None):
@@ -303,7 +312,7 @@ class AffineCouplingBijector(Bijector):
         y = torch.concat(y_a, y_b, dim=1)
         # log determinant
         logdet = self._logdet(s)
-        accum = accum + logdet if accum else logdet
+        accum = accum + logdet if isinstance(accum, torch.Tensor) else logdet
         return y, accum
 
     def _inverse_fn(self, y, accum=None):
@@ -319,7 +328,7 @@ class AffineCouplingBijector(Bijector):
         x = torch.concat(x_a, x_b, dim=1)
         # log determinant
         logdet = self._logdet(y)
-        accum = accum - logdet if accum else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
         return x, accum
 
     def _logdet(self, s):
