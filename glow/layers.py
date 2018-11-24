@@ -105,42 +105,44 @@ class ActivationNormalization(Bijector):
 
         Activation normalizaton module...
     """
-    def __init__(self, channels):
+    def __init__(self, channels, scale=1.0, eps=1e-6):
         super().__init__()
         self.initialized = False
         self.shift = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self._scale = float(scale)
+        self._eps = float(1e-6)
 
     def _data_initialization(self, x):
         assert len(x.size()) == 4, 'ActNorm initialization requires inputs of the form (batch, channel, height, width)'
 
         with torch.no_grad():
-            mean = x.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True).mean(dim=0, keepdim=True)
-            var = x.var(dim=3, keepdim=True).var(dim=2, keepdim=True).var(dim=0, keepdim=True)
-
+            mean = -1.0 * x.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True).mean(dim=0, keepdim=True)
+            var = (x + mean).var(dim=3, keepdim=True).var(dim=2, keepdim=True).var(dim=0, keepdim=True)
+            logstd = torch.log(self._scale / (torch.sqrt(var) + self._eps))
             self.shift.data.copy_(mean)
-            self.scale.data.copy_(var)
+            self.scale.data.copy_(logstd)
 
         self.initialized = True
 
     def _forward_fn(self, x, accum=None):
         """ Forward Function """
+        x_norm = ((x + self.shift) * torch.exp(self.scale))
         logdet = self._logdet(x)
         accum = accum + logdet if isinstance(accum, torch.Tensor) else logdet
-        x_norm = ((x * self.scale) + self.shift)
         return x_norm, accum
 
     def _inverse_fn(self, y, accum=None):
         """ Inverse Function """
+        y_norm = ((y * torch.exp(-self.scale)) - self.shift)
         logdet = self._logdet(y)
-        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
-        y_norm = ((y - self.shift) / self.scale)
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else -logdet
         return y_norm, accum
 
     def _logdet(self, x):
         assert len(x.size()) == 4, 'ActNorm module requires inputs of the form (batch, channel, height, width)'
         h, w = x.size(2), x.size(3)
-        return h * w * torch.abs(self.scale).log().sum()
+        return h * w * self.scale.sum()
 
     def forward(self, data, accum=None):
         if not self.initialized:
@@ -170,7 +172,7 @@ class Inv1x1Conv2dPlainBijector(Bijector):
         inverse_weight = torch.inverse(self.weight)
         x = F.conv2d(y, inverse_weight.view(self.channels, self.channels, 1, 1))
         logdet = self._logdet(y)
-        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else -logdet
         return x, accum
 
     def _logdet(self, x):
@@ -235,7 +237,7 @@ class Inv1x1Conv2dLUBijector(Bijector):
         inverse_weight = torch.matmul(torch.inverse(upper), torch.matmul(torch.inverse(lower), torch.inverse(permutation)))
         x = F.conv2d(y, inverse_weight.view(self.channels, self.channels, 1, 1))
         logdet = self._logdet(y)
-        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else -logdet
         return x, accum
 
     def _logdet(self, x):
@@ -328,7 +330,7 @@ class AffineCouplingBijector(Bijector):
         x = torch.concat(x_a, x_b, dim=1)
         # log determinant
         logdet = self._logdet(y)
-        accum = accum - logdet if isinstance(accum, torch.Tensor) else logdet
+        accum = accum - logdet if isinstance(accum, torch.Tensor) else -logdet
         return x, accum
 
     def _logdet(self, s):
