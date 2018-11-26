@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from numpy.random import randn
 from scipy.linalg import lu, qr
 
+from .ops import gaussian_logp, gaussian_sample
+
 
 class Bijector(nn.Module):
     """ Bijector Module Abstract Base Class """
@@ -28,75 +30,108 @@ class Bijector(nn.Module):
         self._fn = self._inverse_fn if mode == 'inverse' else self._forward_fn
         # TODO mimic nn.Module.train/eval calls children's direction if it exists
 
-    def forward(self, data, accum=None):
-        return self._fn(data, accum)
+    def forward(self, data):
+        if isinstance(data, (tuple, list)):
+            x, accum = data
+        else:
+            x, accum = data, None
+        print(f'Bij x size: {x.size()}')
+        print(f'Bij accum: {accum}')
+        return self._fn(x, accum)
 
 
-class Block(Bijector):
+class FlowBlock(Bijector):
     """ Block """
-    def __init__(self, in_channels, flow_depth=5, num_affine_channels=512, use_lu_optim=False, split_input=True):
+    def __init__(self, in_channels, num_flow=5, split_input=True,
+                 actnorm_scale=1.0, num_coupling_channels=512, coupling_scale=3.0,
+                 additive_coupling=False, coupling_lu_optim=False,
+                 prior_scale=3.0):
         super().__init__()
 
-        squeeze_channels = in_channels * 4
+        self.k = num_flow
+        self.split = split_input
+        self.in_channels = in_channels * 4  # num squeeze channels
 
-        self.k = flow_depth
+        modules = nn.ModuleList()
+        for i in range(1, self.k + 1):
+            modules.append(
+                Flow(self.in_channels, actnorm_scale, num_coupling_channels,
+                     coupling_scale, additive_coupling, coupling_lu_optim)
+            )
+        self.flows = modules
 
-        modules = list()
-        for i in range(1, self.k+1):
-            modules.append(Flow(in_channels, num_affine_channels, use_lu_optim))
-        self.flows = nn.ModuleList(modules)
+        if self.split:
+            self.prior = ZeroInit3x3Conv2d(in_channels * 2, in_channels * 4, prior_scale)
+        else:
+            self.prior = ZeroInit3x3Conv2d(in_channels * 4, in_channels * 8, prior_scale)
 
-    def _forward_fn(self, data, accum=None):
+    def _forward_fn(self, x, accum=None):
+
+        n, c, h, w = input.size()
+        x = x.view(n, c, h // 2, 2, w // 2, 2)
+        x = x.permute(0, 1, 3, 5, 2, 4)
+        x = x.contiguous().view(n, self.in_channels, h // 2, w // 2)
+
         for flow in self.flows:
-            data, accum = flow(data, accum)
-        return data, accum
+            x, accum = flow(x, accum)
+
+        if self.split:
+            x, z = x.chunk(2, dim=1)
+            mean, logsd = self.prior(x).chunk(2, dim=1)
+            logp = gaussian_logp(z, mean, logsd)
+            logp = logp.view(n, -1).sum(dim=1)
+        else:
+            zero = torch.zeros_like(x)
+            mean, logsd = self.prior(zero).chunk(2, dim=1)
+            logp = gaussian_logp(x, mean, logsd)
+            logp = logp.view(n, -1).sum(dim=1)
+            z = x
+
+        return x, accum, logp
 
     def _inverse_fn(self, y, accum=None):
+
+        if self.split:
+            mean, logsd = self.prior(y).chunk(2, dim=1)
+            z = gaussian_sample(accum, mean, logsd)
+            y = torch.cat([y, z], dim=1)
+        else:
+            zero = torch.zeros_like(y)
+            mean, logsd = self.prior(zero).chunk(2, dim=1)
+            z = gaussian_sample(accum, mean, logsd)
+            y = z
+
         for flow in reversed(self.flows):
-            data, accum = flow(y, accum)
-        return data, accum
+            y, accum = flow(y, accum)
 
+        n, c, h, w = input.size()
+        y = y.view(n, c // 4, 2, 2, h, w)
+        y = y.permute(0, 1, 4, 2, 5, 3)
+        y = y.contiguous().view(n, c // 4, h * 2, w * 2)
 
-class Split(nn.Module):
-    """ Split """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x, accum=None):
-        return x.chunk(2, dim=1), accum
-
-
-class Squeeze(nn.Module):
-    """ Squeeze """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x, y=None, accum=None):
-        if y:
-            x = torch.concat([x, y], dim=1)
-        return x, accum
+        return y, accum
 
 
 class Flow(Bijector):
-    """  """
-    def __init__(self, in_channels, num_affine_channels=512, scale=3.0, force_additive=False, use_lu_optim=False):
+    """ Flow Block """
+    def __init__(self, in_channels, actnorm_scale=1.0, num_coupling_channels=512, coupling_scale=3.0, additive_coupling=False, coupling_lu_optim=False):
         super().__init__()
 
-        Inv1x1Conv2dBijector = Inv1x1Conv2dLUBijector if use_lu_optim else Inv1x1Conv2dPlainBijector
+        Inv1x1Conv2dBijector = Inv1x1Conv2dLUBijector if coupling_lu_optim else Inv1x1Conv2dPlainBijector
 
         self.flow = nn.Sequential(OrderedDict([
-            ('actnorm', ActivationNormalization(in_channels)),
-            ('inv1x1', Inv1x1Conv2dBijector(in_channels)),
-            ('coupling', AffineCouplingBijector(in_channels, num_affine_channels, scale, force_additive)),
+            ('actnorm', ActivationNormalization(in_channels, scale=actnorm_scale)),
+            ('permute', Inv1x1Conv2dBijector(in_channels)),
+            ('coupling', AffineCouplingBijector(in_channels, num_coupling_channels, coupling_scale, additive_coupling)),
         ]))
 
     def _forward_fn(self, x, accum=None):
         """ Bijector Forward Function """
-        return self.flow(x, accum)
+        return self.flow((x, accum))
 
     def _inverse_fn(self, y, accum=None):
         """ Bijector Inverse Function """
-        return self._forward_fn(y, accum)
+        return self._forward_fn((y, accum))
 
 
 class ActivationNormalization(Bijector):
@@ -104,13 +139,13 @@ class ActivationNormalization(Bijector):
 
         Activation normalizaton module...
     """
-    def __init__(self, channels, scale=1.0, eps=1e-6):
+    def __init__(self, channels, scale=1.0):
         super().__init__()
         self.initialized = False
         self.shift = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self._scale = float(scale)
-        self._eps = float(1e-6)
+        self._eps = 1e-6
 
     def _data_initialization(self, x):
         assert len(x.size()) == 4, 'ActNorm initialization requires inputs of the form (batch, channel, height, width)'
@@ -143,10 +178,16 @@ class ActivationNormalization(Bijector):
         h, w = x.size(2), x.size(3)
         return h * w * self.scale.sum()
 
-    def forward(self, data, accum=None):
+    def forward(self, data):
+        if isinstance(data, (tuple, list)):
+            x, accum = data
+        else:
+            x, accum = data, None
         if not self.initialized:
-            self._data_initialization(data)
-        return self._fn(data, accum)
+            self._data_initialization(x)
+        print(f'Act x size: {x.size()}')
+        print(f'Act accum: {accum}')
+        return self._fn(x, accum)
 
 
 class Inv1x1Conv2dPlainBijector(Bijector):
@@ -270,13 +311,13 @@ class ZeroInit3x3Conv2d(nn.Module):
 
 class AffineCouplingConv2d(nn.Module):
     """ AffineCouplingConv2d """
-    def __init__(self, in_channels, num_channels=512, scale=3.0, force_additive=False):
+    def __init__(self, in_channels, num_channels=512, scale=3.0, additive_coupling=False):
         super().__init__()
 
         self.in_channels = in_channels
         self.num_channels = num_channels
         self.scale = scale
-        self.affine = (not force_additive)
+        self.affine = (not additive_coupling)
 
         self.block = nn.Sequential(OrderedDict([
             ('conv_1', nn.Conv2d(in_channels // 2, self.num_channels, 3, padding=1)),
@@ -298,10 +339,10 @@ class AffineCouplingConv2d(nn.Module):
 
 class AffineCouplingBijector(Bijector):
     """ AffineCouplingBijector """
-    def __init__(self, in_channels, num_channels=512, scale=3.0, force_additive=False):
+    def __init__(self, in_channels, num_channels=512, scale=3.0, additive_coupling=False):
         super().__init__()
-        self.block = AffineCouplingConv2d(in_channels, num_channels, scale, force_additive)
-        self.affine = self.block.affine
+        self.convblock = AffineCouplingConv2d(in_channels, num_channels, scale, additive_coupling)
+        self.affine = self.convblock.affine
 
     def _forward_fn(self, x, accum=None):
         assert len(x.size()) == 4, 'AffineCouplingBijector module requires inputs of the form (batch, channel, height, width)'
@@ -310,15 +351,15 @@ class AffineCouplingBijector(Bijector):
         print(f'x_a size {x_a.size()}')
         print(f'x_b size {x_b.size()}')
         if self.affine:
-            logdiag, t = self.block(x_b).chunk(2, dim=1)
+            logdiag, t = self.convblock(x_b).chunk(2, dim=1)
             print(f'logdiag size {logdiag.size()}')
             print(f't size {t.size()}')
-            diag = torch.exp(logdiag)
-            y_a = torch.mul(diag, x_a) + t
+            diag = torch.sigmoid(logdiag + 2.)
+            y_a = (diag * x_a) + t
             # log determinant
             logdet = self._logdet(diag)
         else:
-            out = self.block(x_b)
+            out = self.convblock(x_b)
             y_a = x_a + out
             logdet = 0.0
         y_b = x_b
@@ -331,12 +372,12 @@ class AffineCouplingBijector(Bijector):
         # inverse fn
         y_a, y_b = torch.chunk(y, 2, dim=1)
         if self.affine:
-            logdiag, t = self.block(y_b)
-            diag = torch.exp(logdiag)
+            logdiag, t = self.convblock(y_b).chunk(2, dim=1)
+            diag = torch.sigmoid(logdiag + 2.)
             x_a = (y_a - t) / diag
             logdet = self._logdet(y)
         else:
-            out = self.block(y_b)
+            out = self.convblock(y_b)
             x_a = y_a - out
             logdet = 0.0
         x_b = y_b

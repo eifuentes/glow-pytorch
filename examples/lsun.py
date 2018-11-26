@@ -53,7 +53,7 @@ train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size,
 test_dataloader = DataLoader(test_dataset, batch_size=test_batch_sze,
                              shuffle=False, num_workers=num_workers)
 
-layer = AffineCouplingBijector(3)
+layer = Flow(3)
 x, _ = next(iter(train_dataloader))
 x.size()
 
