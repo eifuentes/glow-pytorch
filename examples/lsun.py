@@ -6,7 +6,8 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 import torchvision.transforms as vtransforms
-from glow.model import Glow
+from glow.layers import *
+from glow.model import *
 from torchvision.datasets import LSUN
 
 data_dir = '/Users/eifuentes/Data/lsun/church_outdoor'
@@ -51,6 +52,14 @@ train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size,
                               shuffle=True, num_workers=num_workers)
 test_dataloader = DataLoader(test_dataset, batch_size=test_batch_sze,
                              shuffle=False, num_workers=num_workers)
+
+layer = AffineCouplingBijector(3)
+x, _ = next(iter(train_dataloader))
+x.size()
+
+y, logdet = layer(x)
+y.size()
+logdet
 
 model = Glow(num_input_channels, num_levels, num_flows_per_level, affine, lu)
 model.to(device)
