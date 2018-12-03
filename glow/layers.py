@@ -53,7 +53,7 @@ class FlowBlock(Bijector):
         self.in_channels = in_channels * 4  # num squeeze channels
 
         modules = nn.ModuleList()
-        for i in range(1, self.k + 1):
+        for i in range(self.k):
             modules.append(
                 Flow(self.in_channels, actnorm_scale, num_coupling_channels,
                      coupling_scale, additive_coupling, coupling_lu_optim)
@@ -66,11 +66,15 @@ class FlowBlock(Bijector):
             self.prior = ZeroInit3x3Conv2d(in_channels * 4, in_channels * 8, prior_scale)
 
     def _forward_fn(self, x, accum=None):
+
+        # Squeeze Operation
+        # (n, c, h, w) -> (n, c*4, h//2, h//2)
         n, c, h, w = x.size()
         x = x.view(n, c, h // 2, 2, w // 2, 2)
         x = x.permute(0, 1, 3, 5, 2, 4)
         x = x.contiguous().view(n, self.in_channels, h // 2, w // 2)
-        print(f'FlowBlock x size: {x.size()}')
+        print(f'Flow Squeeze to x size: {x.size()}')
+
         for flow in self.flows:
             x, accum = flow((x, accum))
 
@@ -86,6 +90,7 @@ class FlowBlock(Bijector):
             logp = logp.view(n, -1).sum(dim=1)
             z = x
         print(f'FlowBlock x size: {x.size()}')
+
         return x, accum, logp
 
     def _inverse_fn(self, y, accum=None):
