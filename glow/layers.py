@@ -66,14 +66,13 @@ class FlowBlock(Bijector):
             self.prior = ZeroInit3x3Conv2d(in_channels * 4, in_channels * 8, prior_scale)
 
     def _forward_fn(self, x, accum=None):
-
-        n, c, h, w = input.size()
+        n, c, h, w = x.size()
         x = x.view(n, c, h // 2, 2, w // 2, 2)
         x = x.permute(0, 1, 3, 5, 2, 4)
         x = x.contiguous().view(n, self.in_channels, h // 2, w // 2)
-
+        print(f'FlowBlock x size: {x.size()}')
         for flow in self.flows:
-            x, accum = flow(x, accum)
+            x, accum = flow((x, accum))
 
         if self.split:
             x, z = x.chunk(2, dim=1)
@@ -86,7 +85,7 @@ class FlowBlock(Bijector):
             logp = gaussian_logp(x, mean, logsd)
             logp = logp.view(n, -1).sum(dim=1)
             z = x
-
+        print(f'FlowBlock x size: {x.size()}')
         return x, accum, logp
 
     def _inverse_fn(self, y, accum=None):
@@ -287,7 +286,7 @@ class Inv1x1Conv2dLUBijector(Bijector):
 
 
 class ZeroInit3x3Conv2d(nn.Module):
-    """ ZeroInitConv2d. """
+    """ ZeroInit3x3Conv2d. """
     def __init__(self, in_channels, out_channels, scale=3.0):
         super().__init__()
 
@@ -304,8 +303,10 @@ class ZeroInit3x3Conv2d(nn.Module):
         self.logscale.zero_()
 
     def forward(self, x):
+        print(f'ZeroInit3x3Conv2d In x size: {x.size()}')
         x = self.conv2d(x)
         x = x * torch.exp(self.logscale * self.factor)
+        print(f'ZeroInit3x3Conv2d Out x size: {x.size()}')
         return x
 
 
@@ -320,11 +321,11 @@ class AffineCouplingConv2d(nn.Module):
         self.affine = (not additive_coupling)
 
         self.block = nn.Sequential(OrderedDict([
-            ('conv_1', nn.Conv2d(in_channels // 2, self.num_channels, 3, padding=1)),
+            ('conv_1', nn.Conv2d(self.in_channels // 2, self.num_channels, 3, padding=1)),
             ('relu_1', nn.ReLU(True)),
             ('conv_2', nn.Conv2d(self.num_channels, self.num_channels, 1, padding=0)),
             ('relu_2', nn.ReLU(True)),
-            ('conv_3', ZeroInit3x3Conv2d(self.num_channels, self.num_channels if self.affine else self.num_channels // 2, scale=scale))
+            ('conv_3', ZeroInit3x3Conv2d(self.num_channels, self.in_channels if self.affine else self.in_channels // 2, scale=scale))
         ]))
 
         self.block.conv_1.weight.data.normal_(0, 0.05)
@@ -351,11 +352,14 @@ class AffineCouplingBijector(Bijector):
         print(f'x_a size {x_a.size()}')
         print(f'x_b size {x_b.size()}')
         if self.affine:
-            logdiag, t = self.convblock(x_b).chunk(2, dim=1)
+            logdiag_t = self.convblock(x_b)
+            print(f'AffineCouplingBijector Out x_b size: {logdiag_t.size()}')
+            logdiag, t = logdiag_t.chunk(2, dim=1)
             print(f'logdiag size {logdiag.size()}')
             print(f't size {t.size()}')
             diag = torch.sigmoid(logdiag + 2.)
-            y_a = (diag * x_a) + t
+            print(f'diag size {diag.size()}')
+            y_a = (x_a + t) * diag
             # log determinant
             logdet = self._logdet(diag)
         else:
@@ -363,7 +367,7 @@ class AffineCouplingBijector(Bijector):
             y_a = x_a + out
             logdet = 0.0
         y_b = x_b
-        y = torch.concat(y_a, y_b, dim=1)
+        y = torch.cat([y_a, y_b], dim=1)
         accum = accum + logdet if isinstance(accum, torch.Tensor) else logdet
         return y, accum
 
@@ -381,7 +385,7 @@ class AffineCouplingBijector(Bijector):
             x_a = y_a - out
             logdet = 0.0
         x_b = y_b
-        x = torch.concat(x_a, x_b, dim=1)
+        x = torch.cat([x_a, x_b], dim=1)
         accum = accum - logdet if isinstance(accum, torch.Tensor) else -logdet
         return x, accum
 
