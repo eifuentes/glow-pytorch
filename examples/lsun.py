@@ -6,8 +6,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 import torchvision.transforms as vtransforms
-from glow.layers import *
-from glow.model import *
+from glow.model import Glow
 from torchvision.datasets import LSUN
 
 data_dir = '/Users/eifuentes/Data/lsun/church_outdoor'
@@ -53,16 +52,13 @@ train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size,
 test_dataloader = DataLoader(test_dataset, batch_size=test_batch_sze,
                              shuffle=False, num_workers=num_workers)
 
-layer = Flow(3)
-x, _ = next(iter(train_dataloader))
-x.size()
-
-y, logdet = layer(x)
-y.size()
-logdet
 
 model = Glow(num_input_channels, num_levels, num_flows_per_level, affine, lu)
 model.to(device)
+
+# test locally
+x, _ = next(iter(train_dataloader))
+x.size()
 
 criterion = nn.BCELoss()
 optimizer = Adam(model.parameters(), lr=lr, betas=(beta1, beta2))
